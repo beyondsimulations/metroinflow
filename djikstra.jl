@@ -95,6 +95,27 @@ function dispatch_queues!(station_moved,queue)
     end
 end
 
+function arc_utilization(grapharcs,station_moved)
+    arcs = copy(grapharcs)
+    total_queue = sum(queue,dims=2)
+    arcs.utilization .= 0.0
+    for a in 1:size(grapharcs,1)
+        for o in 1:length(station_moved)
+            for d in 1:length(station_moved)
+                if queue[o,d] > 0
+                    if on_path[o,d,a]
+                        arcs.utilization[a] += station_moved[o] * (queue[o,d]/total_queue[o])
+                    end
+                end
+            end
+        end
+    end
+    arcs.utilization .= arcs.utilization ./ (arcs.capacity * 60)
+    return arcs
+end
+
+
+
 
 distance, previous_nodes = djisktra(nodes,nodeid,grapharcs)
 on_path = create_graph(previous_nodes,grapharcs)
@@ -139,6 +160,9 @@ for step in timesteps
 
     dispatch_queues!(station_moved,queue)
 
+    arcs = arc_utilization(grapharcs,station_moved)
+
     display(bar(station_queue.-station_moved,title="Queue at timestep $step",ylims=(0,25000)))
+    display(bar(arcs.utilization,title="Arc at timestep $step",ylims=(0,1)))
 
 end
