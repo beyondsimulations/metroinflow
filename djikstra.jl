@@ -1,21 +1,30 @@
 # load packages
 using Pkg
 Pkg.activate("metroflow")
-Pkg.add("DataFrames")
-Pkg.add("CSV")
 
 using DataFrames
 using CSV
 using LightGraphs
 using DataStructures
+using JuMP
+using HiGHS
+using DelimitedFiles
+using Plots
+
+# safety factor
+safety = 0.9
 
 # load the data
-grapharcs = CSV.read("metroarcs.csv",DataFrame)
+grapharcs = CSV.read("data_metro/metroarcs.csv", DataFrame)
+demand = CSV.read("data_demand/OD_2022-11-27_fullhour.csv", DataFrame)
 
 # prepare the graph
-nodes = unique(vcat(grapharcs.Origin,grapharcs.Destination))
+nodes = unique(vcat(grapharcs.origin,grapharcs.destination))
 nodeid = Dict([nodes[i] => i for i in eachindex(nodes)])
-arcid = Dict((nodeid[grapharcs.Origin[i]],nodeid[grapharcs.Destination[i]])=> i for i in axes(grapharcs,1))
+arcid = Dict((nodeid[grapharcs.origin[i]],nodeid[grapharcs.destination[i]]) => i for i in axes(grapharcs,1))
+
+# prepare the demand
+timesteps = sort(unique(demand.dayhour))
 
 function djisktra(nodes,nodeid,grapharcs)
     println("Computing distances with Djikstras algorithm.")
@@ -29,9 +38,9 @@ function djisktra(nodes,nodeid,grapharcs)
         while !(isempty(queue))
             origin = dequeue!(queue)
             for arc in axes(grapharcs,1)
-                if nodeid[grapharcs.Origin[arc]] == origin
-                    destination = nodeid[grapharcs.Destination[arc]]
-                    new_distance = distance[nodeid[node],origin] + grapharcs.Traveltime[arc]
+                if nodeid[grapharcs.origin[arc]] == origin
+                    destination = nodeid[grapharcs.destination[arc]]
+                    new_distance = distance[nodeid[node],origin] + grapharcs.traveltime[arc]
                     if new_distance < distance[nodeid[node],destination]
                         distance[nodeid[node],destination] = new_distance
                         previous_nodes[nodeid[node],destination] = origin
@@ -67,9 +76,65 @@ function create_graph(previous_nodes,grapharcs)
     return on_path
 end
 
+function new_arrivals!(nodeid,demand,step,new_queue)
+    for movement in axes(demand,1)
+        if demand.dayhour[movement] == step
+            new_queue[nodeid[demand.origin[movement]],nodeid[demand.destination[movement]]] += demand.value[movement]
+        end
+    end
+end
+
+function dispatch_queues!(station_moved,queue)
+    total_queue = sum(queue,dims=2)
+    for o in axes(queue,1)
+        for d in axes(queue,2)
+            if queue[o,d] > 0
+                queue[o,d] = max(0,round(queue[o,d] - station_moved[o] * (queue[o,d]/total_queue[o])))
+            end
+        end
+    end
+end
+
+
 distance, previous_nodes = djisktra(nodes,nodeid,grapharcs)
 on_path = create_graph(previous_nodes,grapharcs)
+queue = zeros(Float64,length(nodeid),length(nodeid))
 
+for step in timesteps
+    println("Starting timestep $step")
+    new_arrivals!(nodeid,demand,step,queue)
 
+    inflow_model = Model(HiGHS.Optimizer)
+    set_attribute(inflow_model, "presolve", "on")
+    set_attribute(inflow_model, "time_limit", 60.0)
 
+    @variable(
+        inflow_model, 
+        X[eachindex(nodes)].>=0
+        )
+    @objective(
+        inflow_model, Min,
+        sum((sum(queue[o,d] for d in eachindex(nodes)) - X[o] for o in eachindex(nodes)).^2)
+        )
+    @constraint(
+        inflow_model,
+        [a = 1:size(grapharcs,1)],
+        sum(X[o]*(queue[o,d]/(sum(queue[o,e] for e in eachindex(nodes))+1)) for o in eachindex(nodes), d in eachindex(nodes) if on_path[o,d,a] == true) <= grapharcs.capacity[a] * 60 * safety
+        )
+    @constraint(
+        inflow_model,
+        [n = eachindex(nodes)],
+        X[n] <= sum(queue[n,d] for d in eachindex(nodes))
+        )
 
+    JuMP.optimize!(inflow_model)
+    solution_summary(inflow_model)
+
+    station_queue = sum(queue,dims=2)
+    station_moved = value.(X)
+
+    dispatch_queues!(station_moved,queue)
+
+    display(bar(station_queue.-station_moved,title="Queue at timestep $step",ylims=(0,25000)))
+
+end

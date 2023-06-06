@@ -1,4 +1,4 @@
-Origin,Destination,Capacity,Traveltime,Category
+origin,destination,capacity,traveltime,category
 Metro_QatarUniversity,Metro_Legtaifiya,406,4.0,Red Line
 Metro_Lusail,Metro_QatarUniversity,406,4.0,Red Line
 Metro_AlBiddaConcourse,Metro_AlBiddaRedAndGreenPlatformNorthBound,225,2.0,Pedestrian Path
