@@ -16,7 +16,7 @@ safety = 0.9
 
 # load the data
 grapharcs = CSV.read("data_metro/metroarcs.csv", DataFrame)
-demand = CSV.read("data_demand/OD_2022-11-27_fullhour.csv", DataFrame)
+demand = CSV.read("data_demand/OD_2022-11-30_fullhour.csv", DataFrame)
 
 # prepare the graph
 nodes = unique(vcat(grapharcs.origin,grapharcs.destination))
@@ -104,34 +104,38 @@ for step in timesteps
     println("Starting timestep $step")
     new_arrivals!(nodeid,demand,step,queue)
 
-    inflow_model = Model(HiGHS.Optimizer)
-    set_attribute(inflow_model, "presolve", "on")
-    set_attribute(inflow_model, "time_limit", 60.0)
+    if !(3 <= step <= 5)
+        inflow_model = Model(HiGHS.Optimizer)
+        set_attribute(inflow_model, "presolve", "on")
+        set_attribute(inflow_model, "time_limit", 60.0)
 
-    @variable(
-        inflow_model, 
-        X[eachindex(nodes)].>=0
-        )
-    @objective(
-        inflow_model, Min,
-        sum((sum(queue[o,d] for d in eachindex(nodes)) - X[o] for o in eachindex(nodes)).^2)
-        )
-    @constraint(
-        inflow_model,
-        [a = 1:size(grapharcs,1)],
-        sum(X[o]*(queue[o,d]/(sum(queue[o,e] for e in eachindex(nodes))+1)) for o in eachindex(nodes), d in eachindex(nodes) if on_path[o,d,a] == true) <= grapharcs.capacity[a] * 60 * safety
-        )
-    @constraint(
-        inflow_model,
-        [n = eachindex(nodes)],
-        X[n] <= sum(queue[n,d] for d in eachindex(nodes))
-        )
+        @variable(
+            inflow_model, 
+            X[eachindex(nodes)].>=0
+            )
+        @objective(
+            inflow_model, Min,
+            sum((sum(queue[o,d] for d in eachindex(nodes)) - X[o] for o in eachindex(nodes)).^2)
+            )
+        @constraint(
+            inflow_model,
+            [a = 1:size(grapharcs,1)],
+            sum(X[o]*(queue[o,d]/(sum(queue[o,e] for e in eachindex(nodes))+1)) for o in eachindex(nodes), d in eachindex(nodes) if on_path[o,d,a] == true) <= grapharcs.capacity[a] * 60 * safety
+            )
+        @constraint(
+            inflow_model,
+            [n = eachindex(nodes)],
+            X[n] <= sum(queue[n,d] for d in eachindex(nodes))
+            )
 
-    JuMP.optimize!(inflow_model)
-    solution_summary(inflow_model)
+        JuMP.optimize!(inflow_model)
+        solution_summary(inflow_model)
+        station_moved = value.(X)
+    else
+        station_moved = zeros(Float64,length(nodes))
+    end
 
     station_queue = sum(queue,dims=2)
-    station_moved = value.(X)
 
     dispatch_queues!(station_moved,queue)
 
