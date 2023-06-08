@@ -4,15 +4,15 @@ Pkg.activate("metroflow")
 
 using DataFrames
 using CSV
-using LightGraphs
 using DataStructures
 using JuMP
 using HiGHS
-using DelimitedFiles
 using Plots
 
 # safety factor
 safety = 0.9
+# minutes in steps
+minutes_in_step = 60
 
 # load the data
 grapharcs = CSV.read("data_metro/metroarcs.csv", DataFrame)
@@ -100,8 +100,8 @@ function arc_utilization(grapharcs,station_moved)
     total_queue = sum(queue,dims=2)
     arcs.utilization .= 0.0
     for a in 1:size(grapharcs,1)
-        for o in 1:length(station_moved)
-            for d in 1:length(station_moved)
+        for o in eachindex(station_moved)
+            for d in eachindex(station_moved)
                 if queue[o,d] > 0
                     if on_path[o,d,a]
                         arcs.utilization[a] += station_moved[o] * (queue[o,d]/total_queue[o])
@@ -110,16 +110,17 @@ function arc_utilization(grapharcs,station_moved)
             end
         end
     end
-    arcs.utilization .= arcs.utilization ./ (arcs.capacity * 60)
+    arcs.utilization .= arcs.utilization ./ (arcs.capacity * minutes_in_step)
     return arcs
 end
 
 
-
+# Optimization
 
 distance, previous_nodes = djisktra(nodes,nodeid,grapharcs)
 on_path = create_graph(previous_nodes,grapharcs)
 queue = zeros(Float64,length(nodeid),length(nodeid))
+allowed_entry = zeros(Int64,length(timesteps),length(nodeid))
 
 for step in timesteps
     println("Starting timestep $step")
@@ -141,7 +142,7 @@ for step in timesteps
         @constraint(
             inflow_model,
             [a = 1:size(grapharcs,1)],
-            sum(X[o]*(queue[o,d]/(sum(queue[o,e] for e in eachindex(nodes))+1)) for o in eachindex(nodes), d in eachindex(nodes) if on_path[o,d,a] == true) <= grapharcs.capacity[a] * 60 * safety
+            sum(X[o]*(queue[o,d]/(sum(queue[o,e] for e in eachindex(nodes))+1)) for o in eachindex(nodes), d in eachindex(nodes) if on_path[o,d,a] == true) <= grapharcs.capacity[a] * minutes_in_step * safety
             )
         @constraint(
             inflow_model,
@@ -163,6 +164,10 @@ for step in timesteps
     arcs = arc_utilization(grapharcs,station_moved)
 
     display(bar(station_queue.-station_moved,title="Queue at timestep $step",ylims=(0,25000)))
-    display(bar(arcs.utilization,title="Arc at timestep $step",ylims=(0,1)))
+    #display(bar(station_moved,title="Allowed to enter at timestep $step",ylims=(0,25000)))
+    #display(bar(arcs.utilization,title="Arc at timestep $step",ylims=(0,1)))
 
 end
+
+# Simulation
+
