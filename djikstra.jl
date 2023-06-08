@@ -8,25 +8,36 @@ using DataStructures
 using JuMP
 using HiGHS
 using Plots
+using Dates
 
 # safety factor
 safety = 0.9
+
 # minutes in steps
-minutes_in_step = 60
+minutes_in_step = 15
+
+# prefered dispatch
+prefered_dispatch = 75
+
+# max_enter
+max_enter = 5000
+
+# taxi during night
+taxi_night = 75
 
 # load the data
 grapharcs = CSV.read("data_metro/metroarcs.csv", DataFrame)
-demand = CSV.read("data_demand/OD_2022-11-30_fullhour.csv", DataFrame)
 
 # prepare the graph
 nodes = unique(vcat(grapharcs.origin,grapharcs.destination))
 nodeid = Dict([nodes[i] => i for i in eachindex(nodes)])
 arcid = Dict((nodeid[grapharcs.origin[i]],nodeid[grapharcs.destination[i]]) => i for i in axes(grapharcs,1))
 
-# prepare the demand
-timesteps = sort(unique(demand.dayhour))
-
-function djisktra(nodes,nodeid,grapharcs)
+function djisktra(
+    nodes,
+    nodeid,
+    grapharcs
+    )
     println("Computing distances with Djikstras algorithm.")
     nr_nodes = length(nodes)
     distance = fill(Inf,nr_nodes,nr_nodes)
@@ -55,10 +66,14 @@ function djisktra(nodes,nodeid,grapharcs)
             end
         end
     end
-    return distance, previous_nodes
+    return distance, 
+    previous_nodes
 end
 
-function create_graph(previous_nodes,grapharcs)
+function create_graph(
+    previous_nodes,
+    grapharcs
+    )
     nr_nodes = size(previous_nodes,1)
     nr_arcs = size(grapharcs,1)
     on_path = zeros(Bool,nr_nodes,nr_nodes,nr_arcs)
@@ -76,15 +91,23 @@ function create_graph(previous_nodes,grapharcs)
     return on_path
 end
 
-function new_arrivals!(nodeid,demand,step,new_queue)
+function new_arrivals!(
+    nodeid,
+    demand,
+    step,
+    new_queue
+    )
     for movement in axes(demand,1)
-        if demand.dayhour[movement] == step
+        if demand.datetime[movement] == step
             new_queue[nodeid[demand.origin[movement]],nodeid[demand.destination[movement]]] += demand.value[movement]
         end
     end
 end
 
-function dispatch_queues!(station_moved,queue)
+function dispatch_queues!(
+    station_moved,
+    queue
+    )
     total_queue = sum(queue,dims=2)
     for o in axes(queue,1)
         for d in axes(queue,2)
@@ -95,7 +118,10 @@ function dispatch_queues!(station_moved,queue)
     end
 end
 
-function arc_utilization(grapharcs,station_moved)
+function arc_utilization(
+    grapharcs,
+    station_moved
+    )
     arcs = copy(grapharcs)
     total_queue = sum(queue,dims=2)
     arcs.utilization .= 0.0
@@ -114,59 +140,130 @@ function arc_utilization(grapharcs,station_moved)
     return arcs
 end
 
+function metro_model(
+    nodes,
+    queue,
+    grapharcs,
+    on_path,
+    minutes_in_step,
+    safety,
+    prefered_dispatch,
+    max_enter
+    )
+    inflow_model = Model(HiGHS.Optimizer)
+    set_attribute(inflow_model, "presolve", "on")
+    set_attribute(inflow_model, "time_limit", 60.0)
+
+    @variable(
+        inflow_model, 
+        0 .<= X[eachindex(nodes)].<= max_enter
+        )
+    @objective(
+        inflow_model, Min,
+        sum((sum(queue[o,d] for d in eachindex(nodes)) - X[o] for o in eachindex(nodes)).^2)
+        )
+    @constraint(
+        inflow_model,
+        [a = 1:size(grapharcs,1)],
+        sum(X[o]*(queue[o,d]/(sum(queue[o,e] for e in eachindex(nodes))+1)) for o in eachindex(nodes), d in eachindex(nodes) if on_path[o,d,a] == true) <= grapharcs.capacity[a] * minutes_in_step * safety
+        )
+    @constraint(
+        inflow_model,
+        [n = eachindex(nodes); 0 < sum(queue[n,d] for d in eachindex(nodes))],
+        X[n] >= prefered_dispatch
+        )
+    return inflow_model, X
+end
+
+
+function timestep_optimization(
+    date,
+    step,
+    nodeid,
+    nodes,
+    demand,
+    queue,
+    grapharcs,
+    on_path,
+    minutes_in_step,
+    safety,
+    prefered_dispatch,
+    max_enter
+    )
+    println("Starting timestep $step")
+        new_arrivals!(nodeid,demand,step,queue)
+
+        if !(DateTime(date)+Hour(3) <= step <= DateTime(date)+Hour(5))
+            inflow_model, X = metro_model(nodes,queue,grapharcs,on_path,minutes_in_step,safety,prefered_dispatch,max_enter)
+            JuMP.optimize!(inflow_model)
+            solution_summary(inflow_model)
+            station_moved = value.(X)
+        else
+            station_moved = fill(taxi_night,length(nodes))
+        end
+
+        station_allowed = zeros(Int64,length(station_moved))
+        for movement in eachindex(station_moved)
+            if 0 < floor(station_moved[movement]) <= prefered_dispatch 
+                station_allowed[movement] = prefered_dispatch
+            else
+                station_allowed[movement] = floor(station_moved[movement])
+            end
+        end
+
+        station_queue = sum(queue,dims=2)
+
+        dispatch_queues!(station_moved,queue)
+
+        return station_allowed,
+        station_moved,
+        station_queue
+    end
+
+
 
 # Optimization
 
 distance, previous_nodes = djisktra(nodes,nodeid,grapharcs)
 on_path = create_graph(previous_nodes,grapharcs)
 queue = zeros(Float64,length(nodeid),length(nodeid))
-allowed_entry = zeros(Int64,length(timesteps),length(nodeid))
 
-for step in timesteps
-    println("Starting timestep $step")
-    new_arrivals!(nodeid,demand,step,queue)
+for date in Date("2022-11-27"):Date("2022-11-30")
 
-    if !(3 <= step <= 5)
-        inflow_model = Model(HiGHS.Optimizer)
-        set_attribute(inflow_model, "presolve", "on")
-        set_attribute(inflow_model, "time_limit", 60.0)
+    demand = CSV.read("data_demand/OD_$(date)v1.csv", DataFrame)
 
-        @variable(
-            inflow_model, 
-            X[eachindex(nodes)].>=0
-            )
-        @objective(
-            inflow_model, Min,
-            sum((sum(queue[o,d] for d in eachindex(nodes)) - X[o] for o in eachindex(nodes)).^2)
-            )
-        @constraint(
-            inflow_model,
-            [a = 1:size(grapharcs,1)],
-            sum(X[o]*(queue[o,d]/(sum(queue[o,e] for e in eachindex(nodes))+1)) for o in eachindex(nodes), d in eachindex(nodes) if on_path[o,d,a] == true) <= grapharcs.capacity[a] * minutes_in_step * safety
-            )
-        @constraint(
-            inflow_model,
-            [n = eachindex(nodes)],
-            X[n] <= sum(queue[n,d] for d in eachindex(nodes))
-            )
+    timesteps = DateTime(date):Minute(minutes_in_step):DateTime(date)+Day(1)-Minute(minutes_in_step)
 
-        JuMP.optimize!(inflow_model)
-        solution_summary(inflow_model)
-        station_moved = value.(X)
-    else
-        station_moved = zeros(Float64,length(nodes))
+    for step in timesteps
+        
+        station_allowed,
+        station_moved,
+        station_queue = timestep_optimization(
+            date,
+            step,
+            nodeid,
+            nodes,
+            demand,
+            queue,
+            grapharcs,
+            on_path,
+            minutes_in_step,
+            safety,
+            prefered_dispatch,
+            max_enter)
+
+        arcs = arc_utilization(grapharcs,station_moved)
+
+        plot_queue_demand = bar(station_queue,title="Queue at timestep $step",ylims=(0,35000),label="People in Queue")
+            bar!(station_allowed,label="People allowed to Enter",xticks=(1:length(nodes), nodes),xrotation=60,xtickfontsize=4,titlefontsize=12)
+
+        display(plot_queue_demand)
+        #display(bar(station_moved,title="Allowed to enter at timestep $step",ylims=(0,max_enter+100)))
+        plot_arc_demand = bar(arcs.utilization,title="Arc at timestep $step",ylims=(0,1.1),label="Utilization",legend=:topright)
+            hline!([safety],label="Restriction")
+        #display(plot_arc_demand)
+
     end
-
-    station_queue = sum(queue,dims=2)
-
-    dispatch_queues!(station_moved,queue)
-
-    arcs = arc_utilization(grapharcs,station_moved)
-
-    display(bar(station_queue.-station_moved,title="Queue at timestep $step",ylims=(0,25000)))
-    #display(bar(station_moved,title="Allowed to enter at timestep $step",ylims=(0,25000)))
-    #display(bar(arcs.utilization,title="Arc at timestep $step",ylims=(0,1)))
-
 end
 
 # Simulation
