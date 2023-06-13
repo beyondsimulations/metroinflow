@@ -11,19 +11,25 @@ using Plots
 using Dates
 
 # safety factor
-safety = 0.9
+safety = 0.8
 
 # minutes in steps
 minutes_in_step = 15
 
 # prefered dispatch
-prefered_dispatch = 75
+prefered_dispatch = 100
 
 # max_enter
-max_enter = 5000
+max_enter = 6000
+
+# max_change in entry (to previous period!)
+max_change = 1000
 
 # taxi during night
-taxi_night = 75
+taxi_night = 750
+
+# daterange
+daterange = Date("2022-11-27"):Date("2022-11-30")
 
 # load the data
 grapharcs = CSV.read("data_metro/metroarcs.csv", DataFrame)
@@ -32,6 +38,14 @@ grapharcs = CSV.read("data_metro/metroarcs.csv", DataFrame)
 nodes = unique(vcat(grapharcs.origin,grapharcs.destination))
 nodeid = Dict([nodes[i] => i for i in eachindex(nodes)])
 arcid = Dict((nodeid[grapharcs.origin[i]],nodeid[grapharcs.destination[i]]) => i for i in axes(grapharcs,1))
+nodes_clean = replace.(nodes,r"Metro_" => "")
+nodes_clean = replace.(nodes_clean,r"SouthBound" => "SB")
+nodes_clean = replace.(nodes_clean,r"NorthBound" => "NB")
+nodes_clean = replace.(nodes_clean,r"EastBound"  => "EB")
+nodes_clean = replace.(nodes_clean,r"WestBound"  => "WB")
+nodes_clean = replace.(nodes_clean,r"Platform"  => "Plt")
+nodes_clean = replace.(nodes_clean,r"Red"  => "R")
+nodes_clean = replace.(nodes_clean,r"Green"  => "G")
 
 function djisktra(
     nodes,
@@ -120,7 +134,9 @@ end
 
 function arc_utilization(
     grapharcs,
-    station_moved
+    station_moved,
+    queue,
+    on_path
     )
     arcs = copy(grapharcs)
     total_queue = sum(queue,dims=2)
@@ -148,7 +164,9 @@ function metro_model(
     minutes_in_step,
     safety,
     prefered_dispatch,
-    max_enter
+    max_enter,
+    max_change,
+    previous_entry
     )
     inflow_model = Model(HiGHS.Optimizer)
     set_attribute(inflow_model, "presolve", "on")
@@ -172,6 +190,16 @@ function metro_model(
         [n = eachindex(nodes); 0 < sum(queue[n,d] for d in eachindex(nodes))],
         X[n] >= prefered_dispatch
         )
+    @constraint(
+        inflow_model,
+        [n = eachindex(nodes)],
+        X[n] >= previous_entry[n] - max_change
+        )
+    @constraint(
+        inflow_model,
+        [n = eachindex(nodes)],
+        X[n] <= previous_entry[n] + max_change
+        )
     return inflow_model, X
 end
 
@@ -188,18 +216,24 @@ function timestep_optimization(
     minutes_in_step,
     safety,
     prefered_dispatch,
-    max_enter
+    max_enter,
+    max_change,
+    previous_entry
     )
     println("Starting timestep $step")
         new_arrivals!(nodeid,demand,step,queue)
 
         if !(DateTime(date)+Hour(3) <= step <= DateTime(date)+Hour(5))
-            inflow_model, X = metro_model(nodes,queue,grapharcs,on_path,minutes_in_step,safety,prefered_dispatch,max_enter)
+            inflow_model, X = metro_model(nodes,queue,grapharcs,on_path,minutes_in_step,safety,prefered_dispatch,max_enter,max_change,previous_entry)
             JuMP.optimize!(inflow_model)
             solution_summary(inflow_model)
             station_moved = value.(X)
+            arcs = arc_utilization(grapharcs,station_moved,queue,on_path)
+            previous_entry .= station_moved
         else
+            arcs = arc_utilization(grapharcs,zeros(Int64,length(nodes)),queue,on_path)
             station_moved = fill(taxi_night,length(nodes))
+            previous_entry .= max_change
         end
 
         station_allowed = zeros(Int64,length(station_moved))
@@ -217,54 +251,99 @@ function timestep_optimization(
 
         return station_allowed,
         station_moved,
-        station_queue
+        station_queue,
+        arcs,
+        previous_entry
     end
 
+function metro_inflow(
+    daterange,
+    nodeid,
+    nodes,
+    grapharcs,
+    safety,
+    minutes_in_step,
+    prefered_dispatch,
+    max_enter,
+    max_change)
+
+    distance, previous_nodes = djisktra(nodes,nodeid,grapharcs)
+    on_path = create_graph(previous_nodes,grapharcs)
+    queue = zeros(Float64,length(nodeid),length(nodeid))
+    previous_entry = zeros(Float64,length(nodeid),length(nodeid))
+    results_queues = DataFrame(datetime = DateTime[],station=String[],allowed=Int64[],moved=Int64[],queued=Int64[])
+    results_arcs   = DataFrame(datetime = DateTime[],connection=Int64[],line=String[],utilization=Float64[])
+
+    for date in daterange
+
+        demand = CSV.read("data_demand/OD_$(date)v3.csv", DataFrame)
+
+        timesteps = DateTime(date):Minute(minutes_in_step):DateTime(date)+Day(1)-Minute(minutes_in_step)
+
+        for step in timesteps
+            
+            station_allowed,
+            station_moved,
+            station_queue,
+            arcs = timestep_optimization(
+                date,
+                step,
+                nodeid,
+                nodes,
+                demand,
+                queue,
+                grapharcs,
+                on_path,
+                minutes_in_step,
+                safety,
+                prefered_dispatch,
+                max_enter,
+                max_change,
+                previous_entry)
+
+                
+            for station in eachindex(nodes_clean)
+                push!(results_queues,(
+                    datetime = date,
+                    station=nodes_clean[station],
+                    allowed=floor(station_allowed[station]),
+                    moved=floor(station_moved[station]),
+                    queued=floor(station_queue[station])))
+            end
+
+            for arc in 1:size(grapharcs,1)
+                push!(results_arcs,(
+                    datetime = date,
+                    connection=arc,
+                    line=grapharcs.category[arc],
+                    utilization=arcs.utilization[arc]))
+            end
+
+            plot_queue_demand = bar(station_queue,title="Queue at timestep $step",ylims=(0,35000),label="People in Queue",legend=:topright)
+                bar!(station_allowed,label="People allowed to Enter",xticks=(1:length(nodes), nodes_clean),xrotation=30,xtickfontsize=4,titlefontsize=12)
+            display(plot_queue_demand)
+
+            plot_arc_demand = bar(arcs.utilization,title="Metroarcs at timestep $step",ylims=(0,1.1),label="Utilization",legend=:topright,titlefontsize=12)
+                hline!([safety],label="Restriction")
+            #display(plot_arc_demand)
+
+        end
+    end
+    return results_queues, results_arcs
+end
 
 
 # Optimization
-
-distance, previous_nodes = djisktra(nodes,nodeid,grapharcs)
-on_path = create_graph(previous_nodes,grapharcs)
-queue = zeros(Float64,length(nodeid),length(nodeid))
-
-for date in Date("2022-11-27"):Date("2022-11-30")
-
-    demand = CSV.read("data_demand/OD_$(date)v1.csv", DataFrame)
-
-    timesteps = DateTime(date):Minute(minutes_in_step):DateTime(date)+Day(1)-Minute(minutes_in_step)
-
-    for step in timesteps
-        
-        station_allowed,
-        station_moved,
-        station_queue = timestep_optimization(
-            date,
-            step,
-            nodeid,
-            nodes,
-            demand,
-            queue,
-            grapharcs,
-            on_path,
-            minutes_in_step,
-            safety,
-            prefered_dispatch,
-            max_enter)
-
-        arcs = arc_utilization(grapharcs,station_moved)
-
-        plot_queue_demand = bar(station_queue,title="Queue at timestep $step",ylims=(0,35000),label="People in Queue")
-            bar!(station_allowed,label="People allowed to Enter",xticks=(1:length(nodes), nodes),xrotation=60,xtickfontsize=4,titlefontsize=12)
-
-        display(plot_queue_demand)
-        #display(bar(station_moved,title="Allowed to enter at timestep $step",ylims=(0,max_enter+100)))
-        plot_arc_demand = bar(arcs.utilization,title="Arc at timestep $step",ylims=(0,1.1),label="Utilization",legend=:topright)
-            hline!([safety],label="Restriction")
-        #display(plot_arc_demand)
-
-    end
-end
-
+results_queues, results_arcs = metro_inflow(
+    daterange,
+    nodeid,
+    nodes,
+    grapharcs,
+    safety,
+    minutes_in_step,
+    prefered_dispatch,
+    max_enter,
+    max_change
+    )
 # Simulation
 
